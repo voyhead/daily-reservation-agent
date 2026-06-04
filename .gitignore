@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+credentials.json
+token.json
+processed_emails.json
+
+.DS_Store
