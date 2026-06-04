@@ -13,7 +13,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 PROCESSED_EMAILS_FILE = "processed_emails.json"
 
@@ -213,9 +213,40 @@ def send_telegram_message(chat_id, text: str) -> None:
 
     print("Telegram message sent successfully.")
 
+def get_or_create_label_id(service, label_name: str) -> str:
+    result = service.users().labels().list(userId="me").execute()
+    labels = result.get("labels", [])
+
+    for label in labels:
+        if label.get("name") == label_name:
+            return label.get("id")
+
+    created_label = service.users().labels().create(
+        userId="me",
+        body={
+            "name": label_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        }
+    ).execute()
+
+    return created_label["id"]
+
+
+def add_label_to_email(service, message_id: str, label_id: str) -> None:
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={
+            "addLabelIds": [label_id]
+        }
+    ).execute()
+
+    print("Added AI_PROCESSED label to Gmail message.")
+
 
 def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -> list:
-    query = 'is:unread newer_than:7d (booking OR reservation OR reserve OR "book a table" OR "table for")'
+    query = 'is:unread newer_than:7d (booking OR reservation OR reserve OR "book a table" OR "table for") -label:AI_PROCESSED'
 
     result = service.users().messages().list(
         userId="me",
@@ -429,41 +460,28 @@ def main():
     print("Starting daily reservation agent...")
 
     service = get_gmail_service()
+    processed_label_id = get_or_create_label_id(service, "AI_PROCESSED")
     email_list = find_unread_booking_emails(service, max_results=MAX_EMAILS_PER_RUN)
 
-    processed_email_ids = load_processed_email_ids()
     chat_id = get_latest_chat_id()
-
-    new_email_data_list = []
-    skipped_count = 0
-
-    for email_data in email_list:
-        message_id = email_data["id"]
-
-        if message_id in processed_email_ids:
-            skipped_count += 1
-            print("Skipping already processed email:", email_data.get("subject"))
-            continue
-
-        new_email_data_list.append(email_data)
 
     summary_message = format_summary_message(
         total_found=len(email_list),
-        new_count=len(new_email_data_list),
-        skipped_count=skipped_count
+        new_count=len(email_list),
+        skipped_count=0
     )
 
     send_telegram_message(chat_id, summary_message)
 
-    if not new_email_data_list:
+    if not email_list:
         print("No new unread booking-related emails to process.")
         return
 
-    for index, email_data in enumerate(new_email_data_list, start=1):
+    for index, email_data in enumerate(email_list, start=1):
         message_id = email_data["id"]
 
         print("=" * 60)
-        print("Processing new unread booking-related email:")
+        print("Processing new unread booking-related email:") 
         print("From:", email_data["from"])
         print("Subject:", email_data["subject"])
         print("Date:", email_data["date"])
@@ -482,10 +500,9 @@ def main():
 
         send_telegram_message(chat_id, alert_message)
 
-        processed_email_ids.add(message_id)
-        save_processed_email_ids(processed_email_ids)
+        add_label_to_email(service, message_id, processed_label_id)
 
-        print("Marked email as processed.")
+        print("Marked email as processed with AI_PROCESSED label.")
 
     print("Daily reservation agent completed.")
 
