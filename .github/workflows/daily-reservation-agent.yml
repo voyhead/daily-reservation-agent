@@ -1,0 +1,56 @@
+name: Daily Reservation Agent
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron runs in UTC. These two triggers cover the Europe/Dublin
+    # 10:00 hour across winter time and Irish Standard Time; the job below
+    # checks the actual Europe/Dublin hour before running the agent.
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Europe/Dublin schedule
+        id: schedule_check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          dublin_hour="$(TZ=Europe/Dublin date +%H)"
+
+          if [ "$dublin_hour" = "10" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "It is not 10:00 in Europe/Dublin; skipping this UTC trigger."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repository
+        if: steps.schedule_check.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.schedule_check.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.schedule_check.outputs.should_run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run reservation briefing
+        if: steps.schedule_check.outputs.should_run == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: python daily_reservation_agent.py

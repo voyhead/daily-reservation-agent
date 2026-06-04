@@ -1,4 +1,4 @@
-import os.path
+import os
 import base64
 import json
 import requests
@@ -14,8 +14,7 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-
-PROCESSED_EMAILS_FILE = "processed_emails.json"
+PROCESSED_LABEL_NAME = "AI_PROCESSED"
 
 MAX_EMAILS_PER_RUN = 10
 EMAIL_BODY_LIMIT_FOR_AI = 2000
@@ -24,41 +23,76 @@ EMAIL_BODY_PREVIEW_LIMIT = 1000
 
 env = dotenv_values(".env")
 
-TELEGRAM_BOT_TOKEN = env.get("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = env.get("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or env.get("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or env.get("OPENAI_API_KEY")
+GOOGLE_CREDENTIALS_JSON = (
+    os.getenv("GOOGLE_CREDENTIALS_JSON") or env.get("GOOGLE_CREDENTIALS_JSON")
+)
+GOOGLE_TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON") or env.get("GOOGLE_TOKEN_JSON")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN in .env")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment or .env")
+
+if not TELEGRAM_CHAT_ID:
+    raise ValueError("Missing TELEGRAM_CHAT_ID in environment or .env")
 
 if not OPENAI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY in .env")
+    raise ValueError("Missing OPENAI_API_KEY in environment or .env")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def load_json_value(raw_json: str, env_var_name: str) -> dict:
+    try:
+        return json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{env_var_name} must contain valid JSON") from exc
 
 
 def get_gmail_service():
     creds = None
 
-    if os.path.exists("token.json"):
+    if GOOGLE_TOKEN_JSON:
+        token_info = load_json_value(GOOGLE_TOKEN_JSON, "GOOGLE_TOKEN_JSON")
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    elif os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists("credentials.json"):
-                raise FileNotFoundError(
-                    "Missing credentials.json. Put it in this project folder."
+            if os.getenv("CI"):
+                raise RuntimeError(
+                    "Missing or invalid GOOGLE_TOKEN_JSON. "
+                    "GitHub Actions cannot run the local OAuth browser flow."
                 )
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json",
-                SCOPES
-            )
+            if GOOGLE_CREDENTIALS_JSON:
+                credentials_info = load_json_value(
+                    GOOGLE_CREDENTIALS_JSON,
+                    "GOOGLE_CREDENTIALS_JSON"
+                )
+                flow = InstalledAppFlow.from_client_config(
+                    credentials_info,
+                    SCOPES
+                )
+            elif os.path.exists("credentials.json"):
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "credentials.json",
+                    SCOPES
+                )
+            else:
+                raise FileNotFoundError(
+                    "Missing GOOGLE_CREDENTIALS_JSON or credentials.json."
+                )
+
             creds = flow.run_local_server(port=0)
 
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
+        if not GOOGLE_TOKEN_JSON:
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
 
@@ -154,47 +188,6 @@ def clean_email_thread(text: str) -> str:
     return cleaned_text.strip()
 
 
-def load_processed_email_ids() -> set:
-    if not os.path.exists(PROCESSED_EMAILS_FILE):
-        return set()
-
-    with open(PROCESSED_EMAILS_FILE, "r", encoding="utf-8") as file:
-        data = json.load(file)
-
-    return set(data.get("processed_email_ids", []))
-
-
-def save_processed_email_ids(processed_email_ids: set) -> None:
-    data = {
-        "processed_email_ids": sorted(list(processed_email_ids))
-    }
-
-    with open(PROCESSED_EMAILS_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-
-
-def get_latest_chat_id():
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    response = requests.get(url, timeout=10)
-    data = response.json()
-
-    if not data.get("ok"):
-        raise RuntimeError("getUpdates failed")
-
-    results = data.get("result", [])
-
-    if not results:
-        raise RuntimeError("No updates found. Send a message to the bot first.")
-
-    latest_update = results[-1]
-    message = latest_update.get("message")
-
-    if not message:
-        raise RuntimeError("Latest update has no message")
-
-    return message["chat"]["id"]
-
-
 def send_telegram_message(chat_id, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
@@ -246,7 +239,10 @@ def add_label_to_email(service, message_id: str, label_id: str) -> None:
 
 
 def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -> list:
-    query = 'is:unread newer_than:7d (booking OR reservation OR reserve OR "book a table" OR "table for") -label:AI_PROCESSED'
+    query = (
+        'is:unread newer_than:7d -label:AI_PROCESSED '
+        '(booking OR reservation OR reserve OR "book a table" OR "table for")'
+    )
 
     result = service.users().messages().list(
         userId="me",
@@ -277,8 +273,8 @@ def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -
         email_date = get_header(headers, "Date")
         snippet = message.get("snippet", "")
         body_text = clean_email_thread(
-    extract_text_from_payload(message.get("payload", {}))
-)
+            extract_text_from_payload(message.get("payload", {}))
+        )
 
         email_list.append(
             {
@@ -292,7 +288,6 @@ def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -
         )
 
     return email_list
-
 
 def analyze_booking_email_with_ai(email_body: str, subject: str) -> dict:
     schema = {
@@ -460,10 +455,8 @@ def main():
     print("Starting daily reservation agent...")
 
     service = get_gmail_service()
-    processed_label_id = get_or_create_label_id(service, "AI_PROCESSED")
+    processed_label_id = get_or_create_label_id(service, PROCESSED_LABEL_NAME)
     email_list = find_unread_booking_emails(service, max_results=MAX_EMAILS_PER_RUN)
-
-    chat_id = get_latest_chat_id()
 
     summary_message = format_summary_message(
         total_found=len(email_list),
@@ -471,7 +464,7 @@ def main():
         skipped_count=0
     )
 
-    send_telegram_message(chat_id, summary_message)
+    send_telegram_message(TELEGRAM_CHAT_ID, summary_message)
 
     if not email_list:
         print("No new unread booking-related emails to process.")
@@ -498,7 +491,7 @@ def main():
             analysis=analysis
         )
 
-        send_telegram_message(chat_id, alert_message)
+        send_telegram_message(TELEGRAM_CHAT_ID, alert_message)
 
         add_label_to_email(service, message_id, processed_label_id)
 
