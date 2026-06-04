@@ -1,5 +1,7 @@
 import os
 import base64
+from email.message import EmailMessage
+from email.utils import parseaddr
 import json
 import requests
 from datetime import date, datetime
@@ -13,7 +15,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
+]
 PROCESSED_LABEL_NAME = "AI_PROCESSED"
 
 MAX_EMAILS_PER_RUN = 10
@@ -238,6 +243,59 @@ def add_label_to_email(service, message_id: str, label_id: str) -> None:
     print("Added AI_PROCESSED label to Gmail message.")
 
 
+def build_reply_subject(subject) -> str:
+    if not subject:
+        return "Re: Reservation"
+
+    if subject.lower().startswith("re:"):
+        return subject
+
+    return f"Re: {subject}"
+
+
+def create_gmail_reply_draft(service, email_data, reply_body):
+    sender = email_data.get("from")
+    _, sender_address = parseaddr(sender or "")
+
+    if not sender_address:
+        raise ValueError("Cannot create Gmail draft without original sender address.")
+
+    if not reply_body:
+        raise ValueError("Cannot create Gmail draft with empty reply body.")
+
+    if not email_data.get("thread_id"):
+        raise ValueError("Cannot create Gmail draft without original thread ID.")
+
+    message = EmailMessage()
+    message["To"] = sender_address
+    message["Subject"] = build_reply_subject(email_data.get("subject"))
+
+    message_id = email_data.get("message_id_header")
+    references = email_data.get("references")
+
+    if message_id:
+        message["In-Reply-To"] = message_id
+        message["References"] = f"{references} {message_id}" if references else message_id
+
+    message.set_content(reply_body)
+
+    encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    draft = service.users().drafts().create(
+        userId="me",
+        body={
+            "message": {
+                "raw": encoded_message,
+                "threadId": email_data["thread_id"],
+            }
+        }
+    ).execute()
+
+    print("Created Gmail reply draft:", draft.get("id"))
+
+    return draft
+
+
 def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -> list:
     query = (
         'is:unread newer_than:7d -label:AI_PROCESSED '
@@ -271,6 +329,8 @@ def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -
         sender = get_header(headers, "From")
         subject = get_header(headers, "Subject")
         email_date = get_header(headers, "Date")
+        message_id_header = get_header(headers, "Message-ID")
+        references = get_header(headers, "References")
         snippet = message.get("snippet", "")
         body_text = clean_email_thread(
             extract_text_from_payload(message.get("payload", {}))
@@ -279,9 +339,12 @@ def find_unread_booking_emails(service, max_results: int = MAX_EMAILS_PER_RUN) -
         email_list.append(
             {
                 "id": message_id,
+                "thread_id": message.get("threadId"),
                 "from": sender,
                 "subject": subject,
                 "date": email_date,
+                "message_id_header": message_id_header,
+                "references": references,
                 "snippet": snippet,
                 "body": body_text,
             }
@@ -428,7 +491,12 @@ Already processed emails skipped: {skipped_count}
 """.strip()
 
 
-def format_email_alert(index: int, email_data: dict, analysis: dict) -> str:
+def format_email_alert(
+    index: int,
+    email_data: dict,
+    analysis: dict,
+    gmail_draft_status: str
+) -> str:
     body_preview = email_data["body"][:350]
     status = build_status(analysis)
 
@@ -440,6 +508,7 @@ Date: {analysis.get("date") or "Unknown"}
 Time: {analysis.get("time") or "Missing"}
 Party: {analysis.get("party_size") or "Unknown"}
 Phone: {analysis.get("phone") or "Missing"}
+Gmail draft: {gmail_draft_status}
 
 Notes: {analysis.get("notes") or "None"}
 
@@ -485,10 +554,17 @@ def main():
             subject=email_data["subject"] or ""
         )
 
+        create_gmail_reply_draft(
+            service=service,
+            email_data=email_data,
+            reply_body=analysis.get("reply_draft")
+        )
+
         alert_message = format_email_alert(
             index=index,
             email_data=email_data,
-            analysis=analysis
+            analysis=analysis,
+            gmail_draft_status="Created"
         )
 
         send_telegram_message(TELEGRAM_CHAT_ID, alert_message)
