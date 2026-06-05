@@ -8,3 +8,4 @@ token.json
 processed_emails.json
 
 .DS_Store
+experiments/
