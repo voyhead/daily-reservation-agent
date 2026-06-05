@@ -3,11 +3,10 @@ name: Daily Reservation Agent
 on:
   workflow_dispatch:
   schedule:
-    # GitHub cron runs in UTC. These two triggers cover the Europe/Dublin
-    # 10:00 hour across winter time and Irish Standard Time; the job below
-    # checks the actual Europe/Dublin hour before running the agent.
+    # GitHub cron runs in UTC.
+    # During Dublin daylight saving time, 09:00 UTC is 10:00 Europe/Dublin.
+    # The job below checks the actual Europe/Dublin hour before running the agent.
     - cron: "0 9 * * *"
-    - cron: "0 10 * * *"
 
 jobs:
   run-agent:
